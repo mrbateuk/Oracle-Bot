@@ -22,12 +22,13 @@ jobs:
           OCI_REGION: ${{ secrets.OCI_REGION }}
           OCI_KEY: ${{ secrets.OCI_KEY_FILE }}
         run: |
-          mkdir -p ~/.oci
-          # Giai ma Private Key an toan tu chuoi Base64
-          echo "$OCI_KEY" | base64 -d > ~/.oci/oci_api_key.pem
-          chmod 600 ~/.oci/oci_api_key.pem
+          mkdir -p /home/runner/.oci
+          # Giai ma Base64 truc tiep ra tep khoa Private Key
+          echo "$OCI_KEY" | base64 -d > /home/runner/.oci/oci_api_key.pem
+          chmod 600 /home/runner/.oci/oci_api_key.pem
 
-          cat <<EOF > ~/.oci/config
+          # Tao tep cau hinh voi duong dan tuyet doi
+          cat <<EOF > /home/runner/.oci/config
           [DEFAULT]
           user=$OCI_USER
           fingerprint=$OCI_FINGERPRINT
@@ -35,7 +36,7 @@ jobs:
           tenancy=$OCI_TENANCY
           region=$OCI_REGION
           EOF
-          chmod 600 ~/.oci/config
+          chmod 600 /home/runner/.oci/config
 
       - name: Run Stack Apply Job & Alert Telegram
         env:
@@ -47,7 +48,8 @@ jobs:
           OCI_CLI_SUPPRESS_FILE_PERMISSIONS_WARNING: "True"
         run: |
           echo "=== Kiem tra xac thuc ban dau voi Oracle ==="
-          oci os ns get || { echo "LOI XAC THUC OCI! Kiem tra lai Key/Fingerprint."; exit 1; }
+          # Chi dinh tuong minh tep config de tranh loi moi truong
+          oci os ns get --config-file /home/runner/.oci/config || { echo "LOI XAC THUC OCI! Kiem tra lai Key/Fingerprint."; exit 1; }
 
           END_TIME=$((SECONDS + 1500))
 
@@ -55,6 +57,7 @@ jobs:
             echo "--- [$(date '+%H:%M:%S')] Dang gui yeu cau tao may ao ARM... ---"
 
             oci resource-manager job create-apply-job \
+              --config-file /home/runner/.oci/config \
               --stack-id "$STACK_ID" \
               --execution-plan-strategy AUTO_APPROVED \
               --output json > job_output.json 2> job_error.log || true
@@ -64,7 +67,7 @@ jobs:
             if [ -n "$JOB_ID" ]; then
               echo "Da tao Job kiem tra: $JOB_ID"
               while true; do
-                STATUS=$(oci resource-manager job get --job-id "$JOB_ID" --query "data.\"lifecycle-state\"" --raw-output 2>/dev/null || true)
+                STATUS=$(oci resource-manager job get --config-file /home/runner/.oci/config --job-id "$JOB_ID" --query "data.\"lifecycle-state\"" --raw-output 2>/dev/null || true)
                 if [ "$STATUS" = "SUCCEEDED" ]; then
                   echo "===================================================="
                   echo ">>> THANH CONG! May ao da duoc tao hoan tat. <<<"
