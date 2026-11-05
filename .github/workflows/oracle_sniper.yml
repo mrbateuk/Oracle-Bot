@@ -1,43 +1,40 @@
-name: Oracle A1 Always Free - Safe Capacity Check
+name: Oracle A1 Always Free - SDK V2
 
 on:
   schedule:
-    - cron: '17,47 * * * *' # Every 30 min; one launch attempt per run
+    - cron: '17,47 * * * *'
   workflow_dispatch:
     inputs:
       mode:
-        description: 'check = only validate config/limits; launch = attempt one VM creation'
+        description: 'check = no creation, launch = one create request'
         type: choice
-        options:
-          - check
-          - launch
-        default: check
         required: true
+        default: check
+        options: [check, launch]
 
 permissions:
   contents: read
-  actions: write # Needed to disable this workflow when a VM is created
+  actions: write
 
 concurrency:
-  group: oracle-a1-one-at-a-time
+  group: oracle-a1-single-instance
   cancel-in-progress: false
 
 jobs:
   a1:
     runs-on: ubuntu-latest
-    timeout-minutes: 18
+    timeout-minutes: 12
     env:
-      OCI_CLI_SUPPRESS_FILE_PERMISSIONS_WARNING: 'True'
       OCI_TENANCY_OCID: ${{ secrets.OCI_TENANCY_OCID }}
       OCI_USER_OCID: ${{ secrets.OCI_USER_OCID }}
       OCI_FINGERPRINT: ${{ secrets.OCI_FINGERPRINT }}
       OCI_REGION: ${{ secrets.OCI_REGION }}
       OCI_KEY_FILE_B64: ${{ secrets.OCI_KEY_FILE }}
       OCI_SUBNET_ID: ${{ secrets.OCI_SUBNET_ID }}
-      OCI_IMAGE_OCID: ${{ secrets.OCI_IMAGE_OCID }}
-      OCI_AVAILABILITY_DOMAIN: ${{ secrets.OCI_AVAILABILITY_DOMAIN }}
-      OCI_COMPARTMENT_OCID: ${{ secrets.OCI_COMPARTMENT_OCID }}
       OCI_SSH_PUBLIC_KEY: ${{ secrets.OCI_SSH_PUBLIC_KEY }}
+      OCI_IMAGE_OCID: ${{ secrets.OCI_IMAGE_OCID }}
+      OCI_COMPARTMENT_OCID: ${{ secrets.OCI_COMPARTMENT_OCID }}
+      OCI_AVAILABILITY_DOMAIN: ${{ secrets.OCI_AVAILABILITY_DOMAIN }}
       TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
       TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
       GH_TOKEN: ${{ github.token }}
@@ -47,38 +44,43 @@ jobs:
       A1_MEMORY_GB: '12'
       A1_DISPLAY_NAME: 'Oracle-ARM-Always-Free'
     steps:
-      - name: Checkout repository
+      - name: Checkout
         uses: actions/checkout@v4
         with:
           persist-credentials: false
-      - name: Install OCI CLI (venv, no curl-to-bash)
+
+      - name: Install OCI Python SDK
         shell: bash
         run: |
           set -euo pipefail
-          python3 -m venv "$RUNNER_TEMP/oci-cli"
-          "$RUNNER_TEMP/oci-cli/bin/python" -m pip install --disable-pip-version-check --no-cache-dir 'oci-cli==3.96.0'
-          echo "$RUNNER_TEMP/oci-cli/bin" >> "$GITHUB_PATH"
-      - name: Configure API authentication without printing secrets
+          python3 -m venv "$RUNNER_TEMP/oci-sdk"
+          "$RUNNER_TEMP/oci-sdk/bin/python" -m pip install --disable-pip-version-check --quiet 'oci==2.190.0'
+          echo "SDK_PYTHON=$RUNNER_TEMP/oci-sdk/bin/python" >> "$GITHUB_ENV"
+
+      - name: Configure OCI signing key
         shell: bash
         run: |
           set -euo pipefail
-          for field in OCI_TENANCY_OCID OCI_USER_OCID OCI_FINGERPRINT OCI_REGION OCI_KEY_FILE_B64; do
-            if [[ -z "${!field:-}" ]]; then echo "Missing required secret: $field" >&2; exit 1; fi
+          for key in OCI_TENANCY_OCID OCI_USER_OCID OCI_FINGERPRINT OCI_REGION OCI_KEY_FILE_B64 OCI_SUBNET_ID; do
+            if [[ -z "${!key:-}" ]]; then echo "Missing secret: $key" >&2; exit 1; fi
           done
-          mkdir -p "$RUNNER_TEMP/oracle-config"
-          chmod 700 "$RUNNER_TEMP/oracle-config"
-          printf '%s' "$OCI_KEY_FILE_B64" | base64 --decode > "$RUNNER_TEMP/oracle-config/api.pem"
-          chmod 600 "$RUNNER_TEMP/oracle-config/api.pem"
-          openssl pkey -in "$RUNNER_TEMP/oracle-config/api.pem" -noout >/dev/null
+          install -d -m 700 "$RUNNER_TEMP/oci-config"
+          printf '%s' "$OCI_KEY_FILE_B64" | base64 --decode > "$RUNNER_TEMP/oci-config/api.pem"
+          chmod 600 "$RUNNER_TEMP/oci-config/api.pem"
+          openssl pkey -in "$RUNNER_TEMP/oci-config/api.pem" -noout > /dev/null
           {
             printf '[DEFAULT]\n'
             printf 'user=%s\n' "$OCI_USER_OCID"
             printf 'fingerprint=%s\n' "$OCI_FINGERPRINT"
-            printf 'key_file=%s\n' "$RUNNER_TEMP/oracle-config/api.pem"
+            printf 'key_file=%s\n' "$RUNNER_TEMP/oci-config/api.pem"
             printf 'tenancy=%s\n' "$OCI_TENANCY_OCID"
             printf 'region=%s\n' "$OCI_REGION"
-          } > "$RUNNER_TEMP/oracle-config/config"
-          chmod 600 "$RUNNER_TEMP/oracle-config/config"
-          echo "OCI_CONFIG_FILE=$RUNNER_TEMP/oracle-config/config" >> "$GITHUB_ENV"
-      - name: Validate tenancy and run safe single-attempt hunter
-        run: python3 scripts/oci_hunt.py
+          } > "$RUNNER_TEMP/oci-config/config"
+          chmod 600 "$RUNNER_TEMP/oci-config/config"
+          echo "OCI_CONFIG_FILE=$RUNNER_TEMP/oci-config/config" >> "$GITHUB_ENV"
+
+      - name: Check account / safely attempt A1 creation
+        shell: bash
+        run: |
+          set -euo pipefail
+          "$SDK_PYTHON" -u scripts/oci_hunt.py
