@@ -1,11 +1,46 @@
-- name: Run Stack Apply Job & Alert Telegram
+name: Oracle Cloud Capacity Sniper
+
+on:
+  schedule:
+    - cron: '*/30 * * * *'
+  workflow_dispatch:
+
+jobs:
+  hunt:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Setup OCI CLI
+        run: |
+          bash -c "$(curl -L https://raw.githubusercontent.com/oracle/oci-cli/master/scripts/install/install.sh)" -- --accept-all-defaults
+          echo "/home/runner/bin" >> $GITHUB_PATH
+
+      - name: Configure OCI CLI
+        env:
+          OCI_USER: ${{ secrets.OCI_USER_OCID }}
+          OCI_TENANCY: ${{ secrets.OCI_TENANCY_OCID }}
+          OCI_FINGERPRINT: ${{ secrets.OCI_FINGERPRINT }}
+          OCI_REGION: ${{ secrets.OCI_REGION }}
+          OCI_KEY: ${{ secrets.OCI_KEY_FILE }}
+        run: |
+          mkdir -p ~/.oci
+          echo "$OCI_KEY" > ~/.oci/oci_api_key.pem
+          chmod 600 ~/.oci/oci_api_key.pem
+          cat <<EOF > ~/.oci/config
+          [DEFAULT]
+          user=$OCI_USER
+          fingerprint=$OCI_FINGERPRINT
+          key_file=~/.oci/oci_api_key.pem
+          tenancy=$OCI_TENANCY
+          region=$OCI_REGION
+          EOF
+
+      - name: Run Stack Apply Job & Alert Telegram
         env:
           STACK_ID: ${{ secrets.OCI_STACK_ID }}
           TELE_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELE_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
           GH_TOKEN: ${{ github.token }}
         run: |
-          # 1. Kiểm tra xác thực ban đầu với Oracle
           echo "=== Kiểm tra cấu hình OCI CLI ==="
           oci os ns get || { echo "LỖI XÁC THỰC OCI! Kiểm tra lại Key/Fingerprint."; exit 1; }
 
@@ -13,8 +48,7 @@
 
           while [ $SECONDS -lt $END_TIME ]; do
             echo "--- [$(date '+%H:%M:%S')] Đang gửi yêu cầu tạo máy ảo ARM... ---"
-            
-            # Ghi phản hồi ra file tạm để bắt trọn mã lỗi
+
             oci resource-manager job create-apply-job \
               --stack-id "$STACK_ID" \
               --execution-plan-strategy AUTO_APPROVED \
@@ -30,7 +64,7 @@
                   echo "===================================================="
                   echo ">>> THÀNH CÔNG! Máy ảo đã được tạo hoàn tất. <<<"
                   echo "===================================================="
-                  
+
                   MSG="🚀 *CHÚC MỪNG! Máy ảo Oracle Cloud ARM đã tạo thành công!*%0A%0A*Region:* ap-singapore-1%0A*Job ID:* \`$JOB_ID\`%0A*Thời gian:* $(date '+%Y-%m-%d %H:%M:%S')%0A%0A👉 Vào Oracle Console kiểm tra Public IP!"
                   curl -s -X POST "https://api.telegram.org/bot${TELE_TOKEN}/sendMessage" \
                     -d "chat_id=${TELE_CHAT_ID}" \
