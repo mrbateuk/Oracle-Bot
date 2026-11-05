@@ -20,6 +20,15 @@ class StopRun(Exception):
     pass
 
 
+CURRENT_STEP = "NotStarted"
+
+
+def step(name: str) -> None:
+    global CURRENT_STEP
+    CURRENT_STEP = name
+    info("CALL", name)
+
+
 def env(name: str, default: str = "", required: bool = False) -> str:
     value = os.environ.get(name, default).strip()
     if required and not value:
@@ -97,25 +106,36 @@ def choose_ad(identity: Any, tenancy: str, subnet: Any) -> str:
         raise StopRun("OCI_AVAILABILITY_DOMAIN conflicts with the subnet's availability domain")
     if given or subnet_ad:
         return given or subnet_ad
+    step("Identity.ListAvailabilityDomains")
     ads = identity.list_availability_domains(tenancy).data
     if not ads:
         raise StopRun("Oracle returned no Availability Domain")
     return ads[0].name
 
 
-def choose_image(compute: Any, compartment: str) -> str:
+def choose_image(compute: Any, compartment: str, region: str) -> str:
+    # A region-specific platform image previously obtained from this user's
+    # Singapore Cloud Shell may be provided as a fallback. It is still verified
+    # with get_image below before any launch, so a stale ID fails closed.
     image_id = env("OCI_IMAGE_OCID")
+    source = "OCI_IMAGE_OCID"
+    if not image_id and region == "ap-singapore-1":
+        image_id = env("A1_FALLBACK_IMAGE_OCID")
+        source = "A1_FALLBACK_IMAGE_OCID (previously recorded in Cloud Shell)"
     if image_id:
         if not image_id.startswith("ocid1.image."):
-            raise StopRun("OCI_IMAGE_OCID must start with ocid1.image.")
+            raise StopRun("Image OCID must start with ocid1.image.")
+        info("IMAGE", f"Using provided image ID; source={source}; will verify in Oracle")
         return image_id
+    info("IMAGE", "No supplied Image OCID; looking up current Ubuntu ARM image")
+    step("Compute.ListImages")
     items = compute.list_images(
         compartment, operating_system="Canonical Ubuntu", shape="VM.Standard.A1.Flex",
         sort_by="TIMECREATED", sort_order="DESC", limit=10,
     ).data
     if not items:
-        raise StopRun("No compatible Ubuntu ARM image found; set OCI_IMAGE_OCID")
-    info("OK", "Selected latest compatible Canonical Ubuntu A1 image")
+        raise StopRun("No compatible Ubuntu ARM image found. Set OCI_IMAGE_OCID from Oracle Cloud Shell")
+    info("IMAGE", "Selected an Ubuntu ARM image using list_images")
     return items[0].id
 
 
@@ -133,12 +153,13 @@ def check_limits(client: Any, compartment: str, ad: str, ocpus: float, memory: f
     for name, scope, unit in LIMITS:
         kwargs = {"availability_domain": ad} if scope == "ad" else {}
         try:
+            step(f"Limits.GetResourceAvailability({name})")
             result = client.get_resource_availability(
                 "compute", name, compartment, **kwargs,
             ).data
         except oci.exceptions.ServiceError as exc:
             if exc.status in {404} or (exc.status == 400 and exc.code in {"InvalidParameter", "NotSupported"}):
-                info("WARN", f"{name}: usage API unavailable ({exc.code}), quota UNKNOWN")
+                info("WARN", f"{name}: limit query unavailable ({exc.code}); quota UNKNOWN (not confirmed free)")
                 continue
             raise
         # Fractional availability is more accurate than rounded availability.
@@ -156,6 +177,7 @@ def check_limits(client: Any, compartment: str, ad: str, ocpus: float, memory: f
 
 def get_existing(compute: Any, compartment: str, name: str):
     info("PHASE", "Checking existing instances via OCI Python SDK")
+    step("Compute.ListInstances")
     response = oci.pagination.list_call_get_all_results(
         compute.list_instances, compartment, display_name=name,
     )
@@ -167,6 +189,7 @@ def get_existing(compute: Any, compartment: str, name: str):
 
 def wait_running(compute: Any, instance_id: str) -> str:
     for index in range(15):
+        step("Compute.GetInstance")
         state = compute.get_instance(instance_id).data.lifecycle_state
         info("VM", f"Current state: {state}")
         if state in {"RUNNING", "TERMINATED", "TERMINATING"}:
@@ -178,7 +201,9 @@ def wait_running(compute: Any, instance_id: str) -> str:
 
 def handle_oci_error(exc: Exception, mode: str) -> int:
     code, status, message = classify(exc)
-    info("OCI-ERROR", f"code={code}, http={status or 'unknown'}, message={message}")
+    info("OCI-ERROR", f"api={CURRENT_STEP}, code={code}, http={status or 'unknown'}, message={message}")
+    if code == "InvalidParameter" and "compartmentid" in message.lower():
+        info("HINT", "Review OCI_COMPARTMENT_OCID and subnet compartment; check image OCID/region. This is not an out-of-capacity error")
     if code in {"OutOfHostCapacity", "OutOfCapacity", "OutOfHostCapacityError"} or "out of host capacity" in message.lower():
         info("RETRY-LATER", "Oracle lacks host capacity; next scheduled run can retry")
         return 0
@@ -198,7 +223,7 @@ def main() -> int:
     tenancy = env("OCI_TENANCY_OCID", required=True)
     region = env("OCI_REGION", required=True)
     subnet_id = env("OCI_SUBNET_ID", required=True)
-    compartment = env("OCI_COMPARTMENT_OCID", tenancy)
+    configured_compartment = env("OCI_COMPARTMENT_OCID")
     mode = env("HUNT_MODE", "check").lower()
     if mode not in {"check", "launch"}:
         raise StopRun("HUNT_MODE must be 'check' or 'launch'")
@@ -219,13 +244,24 @@ def main() -> int:
     network, compute, identity, limits = get_clients(config)
 
     info("PHASE", "Validating subnet, AD and image")
+    step("Network.GetSubnet")
     subnet = network.get_subnet(subnet_id).data
     if subnet.lifecycle_state != "AVAILABLE":
         raise StopRun(f"Subnet lifecycle_state={subnet.lifecycle_state}; expected AVAILABLE")
     if subnet.prohibit_public_ip_on_vnic:
         raise StopRun("Selected subnet does not allow a public IP")
+    # Do not silently assume every VM lives in tenancy ROOT. If no explicit
+    # compartment is set, use the compartment owning the chosen subnet.
+    # Cross-compartment VNIC attachment users can override this in Secrets.
+    subnet_compartment = getattr(subnet, "compartment_id", None)
+    compartment = configured_compartment or subnet_compartment or tenancy
+    source = "OCI_COMPARTMENT_OCID" if configured_compartment else ("subnet.compartment_id" if subnet_compartment else "tenancy (fallback)")
+    if not compartment.startswith(("ocid1.compartment.", "ocid1.tenancy.")):
+        raise StopRun(f"Compartment OCID source={source} has an invalid prefix")
+    info("COMPARTMENT", f"Selected from {source}; different compartment requires OCI_COMPARTMENT_OCID")
     ad = choose_ad(identity, tenancy, subnet)
-    image_id = choose_image(compute, compartment)
+    image_id = choose_image(compute, compartment, region)
+    step("Compute.GetImage")
     image = compute.get_image(image_id).data
     if image.lifecycle_state in {"DISABLED", "DELETED"}:
         raise StopRun("Selected OS image has been disabled/deleted")
@@ -270,6 +306,7 @@ def main() -> int:
         metadata={"ssh_authorized_keys": ssh_key},
     )
     info("TRY", "Sending exactly one launch request")
+    step("Compute.LaunchInstance")
     try:
         instance = compute.launch_instance(
             details, retry_strategy=oci.retry.NoneRetryStrategy()
