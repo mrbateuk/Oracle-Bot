@@ -45,7 +45,7 @@ jobs:
 
           while [ $SECONDS -lt $END_TIME ]; do
             echo "--- [$(date '+%H:%M:%S')] Đang gửi yêu cầu tạo máy ảo ARM... ---"
-            JOB_ID=$(oci resource-manager job create-apply-job --stack-id "$STACK_ID" --execution-plan-strategy AUTO_APPROVED --query "data.id" --raw-output 2>/dev/null || true)
+            JOB_ID=$(oci resource-manager job create-apply-job --stack-id "$STACK_ID" --execution-plan-strategy AUTO_APPROVED --query "data.id" --raw-output || true)
 
             if [ -n "$JOB_ID" ] && [ "$JOB_ID" != "null" ]; then
               echo "Đã tạo Job kiểm tra: $JOB_ID"
