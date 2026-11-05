@@ -41,7 +41,7 @@ jobs:
           TELE_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
           GH_TOKEN: ${{ github.token }}
         run: |
-          echo "=== Kiểm tra cấu hình OCI CLI ==="
+          echo "=== Kiểm tra xác thực ban đầu với Oracle ==="
           oci os ns get || { echo "LỖI XÁC THỰC OCI! Kiểm tra lại Key/Fingerprint."; exit 1; }
 
           END_TIME=$((SECONDS + 1500))
