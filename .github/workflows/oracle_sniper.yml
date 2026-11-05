@@ -79,16 +79,16 @@ jobs:
                   gh workflow disable "oracle_sniper.yml" --repo "${{ github.repository }}" || true
                   exit 0
                 elif [ "$STATUS" = "FAILED" ]; then
-                  echo "Cum Singapore van het cho (Out of capacity). Nghi 120s de tranh bi chan API..."
+                  echo "Cum Singapore van het cho (Out of capacity). Nghi 180s de tranh bi chan API..."
                   break
                 fi
-                sleep 15
+                sleep 20
               done
             else
               echo ">>> Ghi nhan phan hoi tu Oracle <<<"
               cat job_error.log
               cat job_output.json
-              echo "Tam nghi 120s de giam tai yeu cau..."
+              echo "Tam nghi 180s de he thong Oracle giai phong rate limit..."
             fi
-            sleep 120
+            sleep 180
           done
