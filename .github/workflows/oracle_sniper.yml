@@ -2,7 +2,7 @@ name: Oracle A1 Always Free - SDK V3 (Fix Compartment)
 
 on:
   schedule:
-    - cron: '17,47 * * * *'
+    - cron: '13,43 * * * *'
   workflow_dispatch:
     inputs:
       mode:
