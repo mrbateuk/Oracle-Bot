@@ -1,102 +1,84 @@
-name: Oracle Cloud Capacity Sniper
+name: Oracle A1 Always Free - Safe Capacity Check
 
 on:
   schedule:
-    - cron: '*/30 * * * *'
+    - cron: '17,47 * * * *' # Every 30 min; one launch attempt per run
   workflow_dispatch:
+    inputs:
+      mode:
+        description: 'check = only validate config/limits; launch = attempt one VM creation'
+        type: choice
+        options:
+          - check
+          - launch
+        default: check
+        required: true
+
+permissions:
+  contents: read
+  actions: write # Needed to disable this workflow when a VM is created
+
+concurrency:
+  group: oracle-a1-one-at-a-time
+  cancel-in-progress: false
 
 jobs:
-  hunt:
+  a1:
     runs-on: ubuntu-latest
+    timeout-minutes: 18
+    env:
+      OCI_CLI_SUPPRESS_FILE_PERMISSIONS_WARNING: 'True'
+      OCI_TENANCY_OCID: ${{ secrets.OCI_TENANCY_OCID }}
+      OCI_USER_OCID: ${{ secrets.OCI_USER_OCID }}
+      OCI_FINGERPRINT: ${{ secrets.OCI_FINGERPRINT }}
+      OCI_REGION: ${{ secrets.OCI_REGION }}
+      OCI_KEY_FILE_B64: ${{ secrets.OCI_KEY_FILE }}
+      OCI_SUBNET_ID: ${{ secrets.OCI_SUBNET_ID }}
+      OCI_IMAGE_OCID: ${{ secrets.OCI_IMAGE_OCID }}
+      OCI_AVAILABILITY_DOMAIN: ${{ secrets.OCI_AVAILABILITY_DOMAIN }}
+      OCI_COMPARTMENT_OCID: ${{ secrets.OCI_COMPARTMENT_OCID }}
+      OCI_SSH_PUBLIC_KEY: ${{ secrets.OCI_SSH_PUBLIC_KEY }}
+      TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+      TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+      GH_TOKEN: ${{ github.token }}
+      GITHUB_REPOSITORY: ${{ github.repository }}
+      HUNT_MODE: ${{ github.event_name == 'schedule' && 'launch' || inputs.mode }}
+      A1_OCPUS: '2'
+      A1_MEMORY_GB: '12'
+      A1_DISPLAY_NAME: 'Oracle-ARM-Always-Free'
     steps:
-      - name: Setup OCI CLI
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - name: Install OCI CLI (venv, no curl-to-bash)
+        shell: bash
         run: |
-          bash -c "$(curl -L https://raw.githubusercontent.com/oracle/oci-cli/master/scripts/install/install.sh)" -- --accept-all-defaults
-          echo "/home/runner/bin" >> $GITHUB_PATH
-
-      - name: Configure OCI CLI
-        env:
-          OCI_USER: ${{ secrets.OCI_USER_OCID }}
-          OCI_TENANCY: ${{ secrets.OCI_TENANCY_OCID }}
-          OCI_FINGERPRINT: ${{ secrets.OCI_FINGERPRINT }}
-          OCI_REGION: ${{ secrets.OCI_REGION }}
-          OCI_KEY: ${{ secrets.OCI_KEY_FILE }}
+          set -euo pipefail
+          python3 -m venv "$RUNNER_TEMP/oci-cli"
+          "$RUNNER_TEMP/oci-cli/bin/python" -m pip install --disable-pip-version-check --no-cache-dir 'oci-cli==3.96.0'
+          echo "$RUNNER_TEMP/oci-cli/bin" >> "$GITHUB_PATH"
+      - name: Configure API authentication without printing secrets
+        shell: bash
         run: |
-          mkdir -p /home/runner/.oci
-          echo "$OCI_KEY" | base64 -d > /home/runner/.oci/oci_api_key.pem
-          chmod 600 /home/runner/.oci/oci_api_key.pem
-
-          cat <<EOF > /home/runner/.oci/config
-          [DEFAULT]
-          user=$OCI_USER
-          fingerprint=$OCI_FINGERPRINT
-          key_file=/home/runner/.oci/oci_api_key.pem
-          tenancy=$OCI_TENANCY
-          region=$OCI_REGION
-          EOF
-          chmod 600 /home/runner/.oci/config
-
-      - name: Direct Compute Instance Sniper & Telegram Alert
-        env:
-          TENANCY_ID: ${{ secrets.OCI_TENANCY_OCID }}
-          SUBNET_ID: ${{ secrets.OCI_SUBNET_ID }}
-          TELE_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
-          TELE_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
-          GH_TOKEN: ${{ github.token }}
-          SUPPRESS_LABEL_WARNING: "True"
-          OCI_CLI_SUPPRESS_FILE_PERMISSIONS_WARNING: "True"
-        run: |
-          # Tao SSH Key tam de gan vao VM
-          ssh-keygen -t rsa -b 2048 -N "" -f /home/runner/.oci/id_rsa
-
-          END_TIME=$((SECONDS + 1500))
-
-          while [ $SECONDS -lt $END_TIME ]; do
-            echo "--- [$(date '+%H:%M:%S')] Gui lenh tao VM ARM (4 OCPU, 24GB RAM)... ---"
-
-            RESPONSE=$(oci compute instance launch \
-              --config-file /home/runner/.oci/config \
-              --availability-domain "lBcf:AP-SINGAPORE-1-AD-1" \
-              --compartment-id "$TENANCY_ID" \
-              --shape "VM.Standard.A1.Flex" \
-              --shape-config '{"ocpus":4,"memoryInGBs":24}' \
-              --image-id "ocid1.image.oc1.ap-singapore-1.aaaaaaaaxvfsj3bvzatjfbtulypvtqjavwbdgmxdrz4tn3nc7xrsvcfejoka" \
-              --subnet-id "$SUBNET_ID" \
-              --assign-public-ip true \
-              --display-name "Oracle-ARM-Instance" \
-              --ssh-authorized-keys-file "/home/runner/.oci/id_rsa.pub" \
-              2>&1 || true)
-
-            INSTANCE_ID=$(echo "$RESPONSE" | jq -r '.data.id // empty' 2>/dev/null || true)
-
-            if [ -n "$INSTANCE_ID" ]; then
-              echo "===================================================="
-              echo ">>> THANH CONG! May ao ARM da tao thanh cong! <<<"
-              echo "Instance ID: $INSTANCE_ID"
-              echo "===================================================="
-
-              MSG="🚀 *CHUC MUNG! May ao Oracle Cloud ARM da tao thanh cong!*%0A%0A*Region:* ap-singapore-1%0A*Instance ID:* \`$INSTANCE_ID\`%0A*Thoi gian:* $(date '+%Y-%m-%d %H:%M:%S')%0A%0A👉 Vao Oracle Console kiem tra Public IP!"
-              curl -s -X POST "https://api.telegram.org/bot${TELE_TOKEN}/sendMessage" \
-                -d "chat_id=${TELE_CHAT_ID}" \
-                -d "text=${MSG}" \
-                -d "parse_mode=Markdown"
-
-              curl -s -X POST "https://api.telegram.org/bot${TELE_TOKEN}/sendDocument" \
-                -F "chat_id=${TELE_CHAT_ID}" \
-                -F "document=@/home/runner/.oci/id_rsa" \
-                -F "caption=🔑 Private Key SSH dang nhap may ao (User: ubuntu)"
-
-              gh workflow disable "oracle_sniper.yml" --repo "${{ github.repository }}" || true
-              exit 0
-            else
-              if echo "$RESPONSE" | grep -qi "Out of host capacity"; then
-                echo "Singapore van het slot (Out of host capacity). Cho 15s thu lai..."
-              else
-                echo ">>> CHI TIET PHAN HOI TU ORACLE <<<"
-                echo "$RESPONSE"
-                echo "-------------------------------------"
-              fi
-            fi
-
-            sleep 15
+          set -euo pipefail
+          for field in OCI_TENANCY_OCID OCI_USER_OCID OCI_FINGERPRINT OCI_REGION OCI_KEY_FILE_B64; do
+            if [[ -z "${!field:-}" ]]; then echo "Missing required secret: $field" >&2; exit 1; fi
           done
+          mkdir -p "$RUNNER_TEMP/oracle-config"
+          chmod 700 "$RUNNER_TEMP/oracle-config"
+          printf '%s' "$OCI_KEY_FILE_B64" | base64 --decode > "$RUNNER_TEMP/oracle-config/api.pem"
+          chmod 600 "$RUNNER_TEMP/oracle-config/api.pem"
+          openssl pkey -in "$RUNNER_TEMP/oracle-config/api.pem" -noout >/dev/null
+          {
+            printf '[DEFAULT]\n'
+            printf 'user=%s\n' "$OCI_USER_OCID"
+            printf 'fingerprint=%s\n' "$OCI_FINGERPRINT"
+            printf 'key_file=%s\n' "$RUNNER_TEMP/oracle-config/api.pem"
+            printf 'tenancy=%s\n' "$OCI_TENANCY_OCID"
+            printf 'region=%s\n' "$OCI_REGION"
+          } > "$RUNNER_TEMP/oracle-config/config"
+          chmod 600 "$RUNNER_TEMP/oracle-config/config"
+          echo "OCI_CONFIG_FILE=$RUNNER_TEMP/oracle-config/config" >> "$GITHUB_ENV"
+      - name: Validate tenancy and run safe single-attempt hunter
+        run: python3 scripts/oci_hunt.py
