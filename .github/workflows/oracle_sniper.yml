@@ -23,16 +23,19 @@ jobs:
           OCI_KEY: ${{ secrets.OCI_KEY_FILE }}
         run: |
           mkdir -p ~/.oci
-          echo "$OCI_KEY" > ~/.oci/oci_api_key.pem
+          # Giai ma Private Key an toan tu chuoi Base64
+          echo "$OCI_KEY" | base64 -d > ~/.oci/oci_api_key.pem
           chmod 600 ~/.oci/oci_api_key.pem
+
           cat <<EOF > ~/.oci/config
           [DEFAULT]
           user=$OCI_USER
           fingerprint=$OCI_FINGERPRINT
-          key_file=~/.oci/oci_api_key.pem
+          key_file=/home/runner/.oci/oci_api_key.pem
           tenancy=$OCI_TENANCY
           region=$OCI_REGION
           EOF
+          chmod 600 ~/.oci/config
 
       - name: Run Stack Apply Job & Alert Telegram
         env:
@@ -40,14 +43,16 @@ jobs:
           TELE_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELE_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
           GH_TOKEN: ${{ github.token }}
+          SUPPRESS_LABEL_WARNING: "True"
+          OCI_CLI_SUPPRESS_FILE_PERMISSIONS_WARNING: "True"
         run: |
-          echo "=== Kiểm tra xác thực ban đầu với Oracle ==="
-          oci os ns get || { echo "LỖI XÁC THỰC OCI! Kiểm tra lại Key/Fingerprint."; exit 1; }
+          echo "=== Kiem tra xac thuc ban dau voi Oracle ==="
+          oci os ns get || { echo "LOI XAC THUC OCI! Kiem tra lai Key/Fingerprint."; exit 1; }
 
           END_TIME=$((SECONDS + 1500))
 
           while [ $SECONDS -lt $END_TIME ]; do
-            echo "--- [$(date '+%H:%M:%S')] Đang gửi yêu cầu tạo máy ảo ARM... ---"
+            echo "--- [$(date '+%H:%M:%S')] Dang gui yeu cau tao may ao ARM... ---"
 
             oci resource-manager job create-apply-job \
               --stack-id "$STACK_ID" \
@@ -57,15 +62,15 @@ jobs:
             JOB_ID=$(jq -r '.data.id // empty' job_output.json 2>/dev/null || true)
 
             if [ -n "$JOB_ID" ]; then
-              echo "Đã tạo Job kiểm tra: $JOB_ID"
+              echo "Da tao Job kiem tra: $JOB_ID"
               while true; do
                 STATUS=$(oci resource-manager job get --job-id "$JOB_ID" --query "data.\"lifecycle-state\"" --raw-output 2>/dev/null || true)
                 if [ "$STATUS" = "SUCCEEDED" ]; then
                   echo "===================================================="
-                  echo ">>> THÀNH CÔNG! Máy ảo đã được tạo hoàn tất. <<<"
+                  echo ">>> THANH CONG! May ao da duoc tao hoan tat. <<<"
                   echo "===================================================="
 
-                  MSG="🚀 *CHÚC MỪNG! Máy ảo Oracle Cloud ARM đã tạo thành công!*%0A%0A*Region:* ap-singapore-1%0A*Job ID:* \`$JOB_ID\`%0A*Thời gian:* $(date '+%Y-%m-%d %H:%M:%S')%0A%0A👉 Vào Oracle Console kiểm tra Public IP!"
+                  MSG="🚀 *CHUC MUNG! May ao Oracle Cloud ARM da tao thanh cong!*%0A%0A*Region:* ap-singapore-1%0A*Job ID:* \`$JOB_ID\`%0A*Thoi gian:* $(date '+%Y-%m-%d %H:%M:%S')%0A%0A👉 Vao Oracle Console kiem tra Public IP!"
                   curl -s -X POST "https://api.telegram.org/bot${TELE_TOKEN}/sendMessage" \
                     -d "chat_id=${TELE_CHAT_ID}" \
                     -d "text=${MSG}" \
@@ -74,13 +79,13 @@ jobs:
                   gh workflow disable "oracle_sniper.yml" --repo "${{ github.repository }}" || true
                   exit 0
                 elif [ "$STATUS" = "FAILED" ]; then
-                  echo "Cụm Singapore vẫn hết chỗ (Out of capacity). Thử lại sau 60s..."
+                  echo "Cum Singapore van het cho (Out of capacity). Thu lai sau 60s..."
                   break
                 fi
                 sleep 10
               done
             else
-              echo ">>> CHI TIẾT LỖI TỪ ORACLE <<<"
+              echo ">>> CHI TIET LOI TU ORACLE <<<"
               cat job_error.log
               cat job_output.json
               echo "------------------------------"
