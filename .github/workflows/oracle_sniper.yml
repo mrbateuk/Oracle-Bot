@@ -36,59 +36,68 @@ jobs:
           EOF
           chmod 600 /home/runner/.oci/config
 
-      - name: Run Stack Apply Job & Alert Telegram
+      - name: Direct Compute Instance Sniper & Telegram Alert
         env:
-          STACK_ID: ${{ secrets.OCI_STACK_ID }}
+          TENANCY_ID: ${{ secrets.OCI_TENANCY_OCID }}
+          SUBNET_ID: ${{ secrets.OCI_SUBNET_ID }}
           TELE_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELE_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
           GH_TOKEN: ${{ github.token }}
           SUPPRESS_LABEL_WARNING: "True"
           OCI_CLI_SUPPRESS_FILE_PERMISSIONS_WARNING: "True"
         run: |
-          echo "=== Kiem tra xac thuc ban dau voi Oracle ==="
-          oci os ns get --config-file /home/runner/.oci/config || { echo "LOI XAC THUC OCI! Kiem tra lai Key/Fingerprint."; exit 1; }
+          # 1. Tạo cặp SSH Key để gán vào máy ảo và gửi khóa riêng tư về Telegram
+          ssh-keygen -t rsa -b 2048 -N "" -f /home/runner/.oci/id_rsa
 
           END_TIME=$((SECONDS + 1500))
 
           while [ $SECONDS -lt $END_TIME ]; do
-            echo "--- [$(date '+%H:%M:%S')] Dang gui yeu cau tao may ao ARM... ---"
+            echo "--- [$(date '+%H:%M:%S')] Gui lenh truc tiep tao VM ARM (4 OCPU, 24GB RAM)... ---"
 
-            oci resource-manager job create-apply-job \
+            RESPONSE=$(oci compute instance launch \
               --config-file /home/runner/.oci/config \
-              --stack-id "$STACK_ID" \
-              --execution-plan-strategy AUTO_APPROVED \
-              --output json > job_output.json 2> job_error.log || true
+              --availability-domain "lBcf:AP-SINGAPORE-1-AD-1" \
+              --compartment-id "$TENANCY_ID" \
+              --shape "VM.Standard.A1.Flex" \
+              --shape-config '{"ocpus":4,"memoryInGBs":24}' \
+              --image-id "ocid1.image.oc1.ap-singapore-1.aaaaaaaaxvfsj3bvzatjfbtulypvtqjavwbdgmxdrz4tn3nc7xrsvcfejoka" \
+              --subnet-id "$SUBNET_ID" \
+              --assign-public-ip true \
+              --display-name "Oracle-ARM-Instance" \
+              --ssh-authorized-keys-file "/home/runner/.oci/id_rsa.pub" \
+              --output json 2>&1 || true)
 
-            JOB_ID=$(jq -r '.data.id // empty' job_output.json 2>/dev/null || true)
+            INSTANCE_ID=$(echo "$RESPONSE" | jq -r '.data.id // empty' 2>/dev/null || true)
 
-            if [ -n "$JOB_ID" ]; then
-              echo "Da tao Job kiem tra: $JOB_ID"
-              while true; do
-                STATUS=$(oci resource-manager job get --config-file /home/runner/.oci/config --job-id "$JOB_ID" --query "data.\"lifecycle-state\"" --raw-output 2>/dev/null || true)
-                if [ "$STATUS" = "SUCCEEDED" ]; then
-                  echo "===================================================="
-                  echo ">>> THANH CONG! May ao da duoc tao hoan tat. <<<"
-                  echo "===================================================="
+            if [ -n "$INSTANCE_ID" ]; then
+              echo "===================================================="
+              echo ">>> THÀNH CÔNG! Máy ảo ARM đã được khởi tạo! <<<"
+              echo "Instance ID: $INSTANCE_ID"
+              echo "===================================================="
 
-                  MSG="🚀 *CHUC MUNG! May ao Oracle Cloud ARM da tao thanh cong!*%0A%0A*Region:* ap-singapore-1%0A*Job ID:* \`$JOB_ID\`%0A*Thoi gian:* $(date '+%Y-%m-%d %H:%M:%S')%0A%0A👉 Vao Oracle Console kiem tra Public IP!"
-                  curl -s -X POST "https://api.telegram.org/bot${TELE_TOKEN}/sendMessage" \
-                    -d "chat_id=${TELE_CHAT_ID}" \
-                    -d "text=${MSG}" \
-                    -d "parse_mode=Markdown"
+              # Gửi thông báo thành công về Telegram
+              MSG="🚀 *CHÚC MỪNG! Máy ảo Oracle Cloud ARM đã tạo thành công!*%0A%0A*Region:* ap-singapore-1%0A*Instance ID:* \`$INSTANCE_ID\`%0A*Thời gian:* $(date '+%Y-%m-%d %H:%M:%S')%0A%0A👉 Vào Oracle Console mục Compute > Instances để lấy IP!"
+              curl -s -X POST "https://api.telegram.org/bot${TELE_TOKEN}/sendMessage" \
+                -d "chat_id=${TELE_CHAT_ID}" \
+                -d "text=${MSG}" \
+                -d "parse_mode=Markdown"
 
-                  gh workflow disable "oracle_sniper.yml" --repo "${{ github.repository }}" || true
-                  exit 0
-                elif [ "$STATUS" = "FAILED" ]; then
-                  echo "Cum Singapore van het cho (Out of capacity). Nghi 180s de tranh bi chan API..."
-                  break
-                fi
-                sleep 20
-              done
+              # Gửi kèm Private Key SSH về Telegram dạng file để đăng nhập Putty/Terminal
+              curl -s -X POST "https://api.telegram.org/bot${TELE_TOKEN}/sendDocument" \
+                -F "chat_id=${TELE_CHAT_ID}" \
+                -F "document=@/home/runner/.oci/id_rsa" \
+                -F "caption=🔑 Private Key SSH đăng nhập máy ảo (User: ubuntu)"
+
+              # Vô hiệu hóa workflow sau khi thành công
+              gh workflow disable "oracle_sniper.yml" --repo "${{ github.repository }}" || true
+              exit 0
             else
-              echo ">>> Ghi nhan phan hoi tu Oracle <<<"
-              cat job_error.log
-              cat job_output.json
-              echo "Tam nghi 180s de he thong Oracle giai phong rate limit..."
+              if echo "$RESPONSE" | grep -qi "Out of host capacity"; then
+                echo "Singapore van het slot (Out of capacity). Cho 15s thu lai..."
+              else
+                echo "Phan hoi tu Oracle: $(echo "$RESPONSE" | jq -r '.message // .' 2>/dev/null | head -n 2)"
+              fi
             fi
-            sleep 180
+
+            sleep 15
           done
