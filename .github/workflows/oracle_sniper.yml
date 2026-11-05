@@ -23,11 +23,9 @@ jobs:
           OCI_KEY: ${{ secrets.OCI_KEY_FILE }}
         run: |
           mkdir -p /home/runner/.oci
-          # Giai ma Base64 truc tiep ra tep khoa Private Key
           echo "$OCI_KEY" | base64 -d > /home/runner/.oci/oci_api_key.pem
           chmod 600 /home/runner/.oci/oci_api_key.pem
 
-          # Tao tep cau hinh voi duong dan tuyet doi
           cat <<EOF > /home/runner/.oci/config
           [DEFAULT]
           user=$OCI_USER
@@ -48,7 +46,6 @@ jobs:
           OCI_CLI_SUPPRESS_FILE_PERMISSIONS_WARNING: "True"
         run: |
           echo "=== Kiem tra xac thuc ban dau voi Oracle ==="
-          # Chi dinh tuong minh tep config de tranh loi moi truong
           oci os ns get --config-file /home/runner/.oci/config || { echo "LOI XAC THUC OCI! Kiem tra lai Key/Fingerprint."; exit 1; }
 
           END_TIME=$((SECONDS + 1500))
