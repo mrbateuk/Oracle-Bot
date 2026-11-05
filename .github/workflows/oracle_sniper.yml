@@ -1,4 +1,4 @@
-name: Oracle A1 Always Free - SDK V2
+name: Oracle A1 Always Free - SDK V3 (Fix Compartment)
 
 on:
   schedule:
@@ -22,6 +22,8 @@ concurrency:
 
 jobs:
   a1:
+    # Schedule is intentionally disabled until the operator approves after check.
+    if: github.event_name != 'schedule' || vars.OCI_ENABLE_SCHEDULE == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 12
     env:
@@ -33,6 +35,9 @@ jobs:
       OCI_SUBNET_ID: ${{ secrets.OCI_SUBNET_ID }}
       OCI_SSH_PUBLIC_KEY: ${{ secrets.OCI_SSH_PUBLIC_KEY }}
       OCI_IMAGE_OCID: ${{ secrets.OCI_IMAGE_OCID }}
+      # Known Ubuntu ARM image previously obtained in user's Singapore Cloud Shell;
+      # override in OCI_IMAGE_OCID to use another approved current image.
+      A1_FALLBACK_IMAGE_OCID: 'ocid1.image.oc1.ap-singapore-1.aaaaaaaaxvfsj3bvzatjfbtulypvtqjavwbdgmxdrz4tn3nc7xrsvcfejoka' 
       OCI_COMPARTMENT_OCID: ${{ secrets.OCI_COMPARTMENT_OCID }}
       OCI_AVAILABILITY_DOMAIN: ${{ secrets.OCI_AVAILABILITY_DOMAIN }}
       TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
@@ -45,7 +50,7 @@ jobs:
       A1_DISPLAY_NAME: 'Oracle-ARM-Always-Free'
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
         with:
           persist-credentials: false
 
