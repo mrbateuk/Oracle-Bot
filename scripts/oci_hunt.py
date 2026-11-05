@@ -1,313 +1,305 @@
 #!/usr/bin/env python3
-"""OCI Always Free A1 2 OCPU/12GB safe single-attempt launcher.
+"""Safe Oracle A1 Always Free launcher using the OCI Python SDK (not CLI JSON).
 
-No private SSH keys are generated/uploaded; no repeated fast polling of launch.
-Designed for a fresh GitHub Actions runner invoked every 30 minutes.
+Run once per GitHub Actions invocation. No credentials or SSH private key in logs.
 """
 from __future__ import annotations
 
-import json
 import os
-import re
 import subprocess
 import sys
 import time
 import urllib.parse
 import urllib.request
-from dataclasses import dataclass
 from typing import Any
 
-
-@dataclass
-class OCIError(Exception):
-    code: str
-    message: str
-    status: int | None = None
-
-    def __str__(self) -> str:
-        return f"{self.code}: {self.message}"
+import oci
 
 
-def required(name: str) -> str:
-    value = os.getenv(name, "").strip()
-    if not value:
-        raise ValueError(f"Missing required GitHub secret / environment variable: {name}")
+class StopRun(Exception):
+    pass
+
+
+def env(name: str, default: str = "", required: bool = False) -> str:
+    value = os.environ.get(name, default).strip()
+    if required and not value:
+        raise StopRun(f"Missing GitHub secret/environment: {name}")
     return value
 
 
-def safe_num(value: Any) -> float | None:
-    try:
-        return float(value) if value is not None else None
-    except (ValueError, TypeError):
-        return None
-
-
-def error_from_text(message: str) -> OCIError:
-    code = re.search(r'"code"\s*:\s*"([^"]+)"', message)
-    status = re.search(r'"status"\s*:\s*(\d+)', message)
-    reason = re.search(r'"message"\s*:\s*"([^"]+)"', message)
-    if reason:
-        detail = reason.group(1)
-    else:
-        detail = message.strip().splitlines()[-1][:350] if message.strip() else "No OCI error details returned"
-    return OCIError(code.group(1) if code else "OCIError", detail, int(status.group(1)) if status else None)
-
-
-def oci(*args: str, timeout: int = 85) -> dict[str, Any]:
-    config = required("OCI_CONFIG_FILE")
-    cmd = ["oci", *args, "--config-file", config, "--no-retry", "--output", "json"]
-    try:
-        p = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout, check=False)
-    except subprocess.TimeoutExpired:
-        raise OCIError("Timeout", f"OCI request timed out after {timeout}s") from None
-    if p.returncode != 0:
-        raise error_from_text(p.stderr or p.stdout)
-    try:
-        return json.loads(p.stdout)
-    except json.JSONDecodeError:
-        raise OCIError("BadJSON", "OCI CLI returned invalid JSON") from None
-
-
-def data(*args: str, timeout: int = 85) -> Any:
-    return oci(*args, timeout=timeout).get("data")
+def info(kind: str, message: str) -> None:
+    print(f"[{kind}] {message}", flush=True)
 
 
 def notify(message: str) -> None:
-    token = os.getenv("TELEGRAM_BOT_TOKEN", "")
-    chat = os.getenv("TELEGRAM_CHAT_ID", "")
-    if not (token and chat):
-        print("[INFO] Telegram not configured; no message sent")
+    token, chat_id = env("TELEGRAM_BOT_TOKEN"), env("TELEGRAM_CHAT_ID")
+    if not token or not chat_id:
         return
-    payload = urllib.parse.urlencode({"chat_id": chat, "text": message}).encode("utf-8")
-    req = urllib.request.Request(f"https://api.telegram.org/bot{token}/sendMessage", data=payload)
+    data = urllib.parse.urlencode({"chat_id": chat_id, "text": message}).encode("utf-8")
+    request = urllib.request.Request(f"https://api.telegram.org/bot{token}/sendMessage", data=data)
     try:
-        with urllib.request.urlopen(req, timeout=12) as resp:
-            if resp.status != 200:
-                print("[WARN] Telegram notification returned a non-200 status")
+        with urllib.request.urlopen(request, timeout=12) as reply:
+            if reply.status != 200:
+                info("WARN", "Telegram notification failed")
     except Exception:
-        print("[WARN] Cannot send Telegram message (token/details hidden)")
+        info("WARN", "Telegram notification unavailable (details hidden)")
 
 
-def disable_workflow() -> bool:
-    repo = os.getenv("GITHUB_REPOSITORY", "")
-    token = os.getenv("GH_TOKEN", "")
+def disable_workflow() -> None:
+    repo, token = env("GITHUB_REPOSITORY"), env("GH_TOKEN")
     if not repo or not token:
-        print("[WARN] Cannot disable workflow automatically (missing GitHub context)")
-        return False
-    command = ["gh", "workflow", "disable", "oracle_sniper.yml", "--repo", repo]
+        info("WARN", "Could not auto-disable workflow (missing GitHub token)")
+        return
     try:
-        result = subprocess.run(command, env={**os.environ, "GH_TOKEN": token}, capture_output=True, text=True, timeout=20)
-        if result.returncode == 0:
-            print("[OK] Scheduled workflow disabled; no more retries")
-            return True
-        print("[WARN] Unable to disable workflow; check repo Actions permissions")
+        result = subprocess.run(
+            ["gh", "workflow", "disable", "oracle_sniper.yml", "--repo", repo],
+            env={**os.environ, "GH_TOKEN": token}, capture_output=True, text=True,
+            timeout=25, check=False,
+        )
+        info("OK" if result.returncode == 0 else "WARN",
+             "Workflow disabled" if result.returncode == 0 else "Workflow could not auto-disable; disable manually")
     except (OSError, subprocess.TimeoutExpired):
-        print("[WARN] GitHub CLI unavailable / timed out while disabling workflow")
-    return False
+        info("WARN", "GitHub CLI unavailable; disable workflow manually")
 
 
-def get_ad(tenancy: str, subnet: dict[str, Any]) -> str:
-    ad_override = os.getenv("OCI_AVAILABILITY_DOMAIN", "").strip()
-    subnet_ad = (subnet.get("availability-domain") or "").strip()
-    if ad_override and subnet_ad and ad_override != subnet_ad:
-        raise ValueError("OCI_AVAILABILITY_DOMAIN conflicts with subnet availability domain")
-    if ad_override or subnet_ad:
-        return ad_override or subnet_ad
-    ads = data("iam", "availability-domain", "list", "--compartment-id", tenancy)
-    if not isinstance(ads, list) or not ads:
-        raise ValueError("No availability domain returned by OCI")
-    return ads[0]["name"]
+def classify(exc: Exception) -> tuple[str, int | None, str]:
+    """Return safe OCI error metadata; never dump keys/headers/raw payloads."""
+    if isinstance(exc, oci.exceptions.ServiceError):
+        return exc.code or "ServiceError", exc.status, str(exc.message or "OCI API error")[:500]
+    return type(exc).__name__, None, str(exc)[:240]
 
 
-def resolve_image(compartment: str) -> str:
-    explicit = os.getenv("OCI_IMAGE_OCID", "").strip()
-    if explicit:
-        if not explicit.startswith("ocid1.image."):
-            raise ValueError("OCI_IMAGE_OCID must start with ocid1.image.")
-        return explicit
-    images = data("compute", "image", "list", "--compartment-id", compartment,
-                  "--operating-system", "Canonical Ubuntu", "--shape", "VM.Standard.A1.Flex",
-                  "--sort-by", "TIMECREATED", "--sort-order", "DESC", "--limit", "10")
-    if not images:
-        raise ValueError("No Ubuntu ARM-compatible image returned. Set OCI_IMAGE_OCID explicitly")
-    selected = images[0]["id"]
-    print("[INFO] Using most recent Ubuntu A1-compatible platform image from OCI")
-    return selected
-
-
-LIMITS = [
-    ("standard-a1-core-count", "ad", "cpu"),
-    ("standard-a1-memory-count", "ad", "ram"),
-    ("standard-a1-core-regional-count", "regional", "cpu"),
-    ("standard-a1-memory-regional-count", "regional", "ram"),
-]
-
-
-def check_limits(compartment: str, ad: str, ocpus: float, memory: float) -> None:
-    """Stop only if OCI affirmatively returns insufficient quota.
-
-    Some OCI tenancy/limits do not implement this API: unknown is reported, not
-    misrepresented as capacity or as a confirmed limit.
-    """
-    for limit, scope, unit in LIMITS:
-        cmd = ["limits", "resource-availability", "get",
-               "--service-name", "compute", "--limit-name", limit, "--compartment-id", compartment]
-        if scope == "ad":
-            cmd += ["--availability-domain", ad]
-        try:
-            result = data(*cmd, timeout=35)
-        except OCIError as e:
-            if e.code in {"NotAuthenticated", "NotAuthorizedOrNotFound"} and e.status == 401:
-                raise
-            print(f"[WARN] Limit {limit}: not accessible ({e.code}); capacity remains UNKNOWN")
-            continue
-        if not isinstance(result, dict):
-            print(f"[WARN] Limit {limit}: no resource availability returned")
-            continue
-        free = safe_num(result.get("fractional-available"))
-        if free is None:
-            free = safe_num(result.get("available"))
-        used = result.get("used", "unknown")
-        print(f"[LIMIT] {limit}: available={free if free is not None else 'unknown'}, used={used}")
-        required_qty = ocpus if unit == "cpu" else memory
-        if free is not None and free < required_qty:
-            raise OCIError("LimitExceeded", f"Not enough quota for {limit}: requires {required_qty}; available {free}")
-
-
-def get_existing(compartment: str, name: str) -> dict[str, Any] | None:
-    instances = data("compute", "instance", "list", "--compartment-id", compartment, "--all")
-    for inst in instances or []:
-        if inst.get("display-name") == name and inst.get("lifecycle-state") not in {"TERMINATED", "TERMINATING"}:
-            return inst
-    return None
-
-
-def wait_running(instance_id: str) -> str:
-    for attempt in range(20):
-        inst = data("compute", "instance", "get", "--instance-id", instance_id, timeout=40)
-        state = inst.get("lifecycle-state", "UNKNOWN")
-        print(f"[VM] instance status: {state}")
-        if state == "RUNNING":
-            return state
-        if state in {"TERMINATED", "TERMINATING"}:
-            return state
-        if attempt < 19:
-            time.sleep(15)
-    return "PROVISIONING_OR_UNKNOWN"
-
-
-def validate_ssh_pubkey() -> str:
-    key = required("OCI_SSH_PUBLIC_KEY")
-    if "\n" in key or not key.startswith(("ssh-ed25519 ", "ssh-rsa ", "ecdsa-sha2-")):
-        raise ValueError("OCI_SSH_PUBLIC_KEY must be a single OpenSSH public key")
+def validate_pubkey() -> str:
+    key = env("OCI_SSH_PUBLIC_KEY", required=True)
+    parts = key.split()
+    if len(parts) < 2 or parts[0] not in {"ssh-rsa", "ssh-ed25519", "ecdsa-sha2-nistp256"}:
+        raise StopRun("OCI_SSH_PUBLIC_KEY is not a valid one-line OpenSSH public key")
+    if "\n" in key or len(parts[1]) < 80:
+        raise StopRun("OCI_SSH_PUBLIC_KEY is empty/invalid")
     return key
 
 
-def main() -> int:
-    tenancy = required("OCI_TENANCY_OCID")
-    region = required("OCI_REGION")
-    compartment = os.getenv("OCI_COMPARTMENT_OCID", "").strip() or tenancy
-    subnet_id = required("OCI_SUBNET_ID")
-    name = os.getenv("A1_DISPLAY_NAME", "Oracle-ARM-Always-Free")
-    ocpus = float(os.getenv("A1_OCPUS", "2"))
-    memory = float(os.getenv("A1_MEMORY_GB", "12"))
-    mode = os.getenv("HUNT_MODE", "check").strip().lower()
+def get_clients(config: dict[str, Any]):
+    # No automatic retry storms when Oracle reports 429 or capacity errors.
+    opts = {"retry_strategy": oci.retry.NoneRetryStrategy()}
+    return (
+        oci.core.VirtualNetworkClient(config, **opts),
+        oci.core.ComputeClient(config, **opts),
+        oci.identity.IdentityClient(config, **opts),
+        oci.limits.LimitsClient(config, **opts),
+    )
 
-    # Refuse requests beyond the documented 2026 Always Free A1 allowance.
-    if ocpus <= 0 or memory <= 0 or ocpus > 2 or memory > 12:
-        raise ValueError("STOP: 2026 Always Free A1 max total = 2 OCPUs / 12 GB RAM")
-    if mode not in {"check", "launch"}:
-        raise ValueError("HUNT_MODE must be check or launch")
-    print(f"[INFO] Mode={mode}, region={region}, shape=VM.Standard.A1.Flex, {ocpus:g} OCPU/{memory:g} GB")
 
-    subnet = data("network", "subnet", "get", "--subnet-id", subnet_id)
-    if subnet.get("prohibit-public-ip-on-vnic") is True:
-        raise ValueError("Subnet does not allow public IP; choose the existing public subnet")
-    if subnet.get("lifecycle-state") not in {"AVAILABLE", None}:
-        raise ValueError("Subnet must be AVAILABLE")
-    ad = get_ad(tenancy, subnet)
-    image_id = resolve_image(compartment)
-    # Verify image is known to OCI before launching.
-    image = data("compute", "image", "get", "--image-id", image_id)
-    if image.get("lifecycle-state") in {"DISABLED", "DELETED"}:
-        raise ValueError("Selected image is disabled/deleted; choose a current Ubuntu ARM image")
-    print(f"[OK] Network and image validated; AD={ad}")
+def choose_ad(identity: Any, tenancy: str, subnet: Any) -> str:
+    given = env("OCI_AVAILABILITY_DOMAIN")
+    subnet_ad = getattr(subnet, "availability_domain", None)
+    if given and subnet_ad and given != subnet_ad:
+        raise StopRun("OCI_AVAILABILITY_DOMAIN conflicts with the subnet's availability domain")
+    if given or subnet_ad:
+        return given or subnet_ad
+    ads = identity.list_availability_domains(tenancy).data
+    if not ads:
+        raise StopRun("Oracle returned no Availability Domain")
+    return ads[0].name
 
-    existing = get_existing(compartment, name)
-    if existing:
-        state = existing.get("lifecycle-state", "UNKNOWN")
-        print(f"[INFO] Existing named instance detected: status={state}; no duplicate will be created")
-        if mode == "launch" and state == "RUNNING":
-            notify(f"Oracle A1 2 OCPU/12GB already exists and is RUNNING in {region}. Check OCI Console.")
-            disable_workflow()
-        return 0
 
-    try:
-        check_limits(compartment, ad, ocpus, memory)
-    except OCIError as err:
-        if err.code == "LimitExceeded" and mode == "launch":
-            print(f"[HALT] {err.message}; no VM launch attempted")
-            notify("Oracle A1 hunt stopped: available A1 quota is insufficient. Check OCI Limits.")
-            disable_workflow()
-        raise
-    print("[OK] Preflight complete (limits without API data remain UNKNOWN, not guaranteed)")
-    if mode == "check":
-        print("[SAFE] Check mode: no VM was created. Use Run workflow > launch to attempt creation.")
-        return 0
+def choose_image(compute: Any, compartment: str) -> str:
+    image_id = env("OCI_IMAGE_OCID")
+    if image_id:
+        if not image_id.startswith("ocid1.image."):
+            raise StopRun("OCI_IMAGE_OCID must start with ocid1.image.")
+        return image_id
+    items = compute.list_images(
+        compartment, operating_system="Canonical Ubuntu", shape="VM.Standard.A1.Flex",
+        sort_by="TIMECREATED", sort_order="DESC", limit=10,
+    ).data
+    if not items:
+        raise StopRun("No compatible Ubuntu ARM image found; set OCI_IMAGE_OCID")
+    info("OK", "Selected latest compatible Canonical Ubuntu A1 image")
+    return items[0].id
 
-    ssh_key = validate_ssh_pubkey()
-    import tempfile
-    with tempfile.NamedTemporaryFile("w", encoding="utf-8", prefix="a1-key-", delete=True) as keyfile:
-        keyfile.write(ssh_key + "\n")
-        keyfile.flush()
-        os.chmod(keyfile.name, 0o600)
-        print("[TRY] Sending ONE VM launch request; not retrying rapidly")
+
+# Note: the exact limit names/availability depend on the tenancy. 404 can mean
+# that usage/availability API is unsupported for that limit, not that capacity is free.
+LIMITS = (
+    ("standard-a1-core-count", "ad", "cpu"),
+    ("standard-a1-memory-count", "ad", "memory"),
+    ("standard-a1-core-regional-count", "region", "cpu"),
+    ("standard-a1-memory-regional-count", "region", "memory"),
+)
+
+
+def check_limits(client: Any, compartment: str, ad: str, ocpus: float, memory: float) -> None:
+    for name, scope, unit in LIMITS:
+        kwargs = {"availability_domain": ad} if scope == "ad" else {}
         try:
-            inst = data("compute", "instance", "launch",
-                        "--availability-domain", ad,
-                        "--compartment-id", compartment,
-                        "--shape", "VM.Standard.A1.Flex",
-                        "--shape-config", json.dumps({"ocpus": ocpus, "memoryInGBs": memory}),
-                        "--image-id", image_id,
-                        "--subnet-id", subnet_id,
-                        "--assign-public-ip", "true",
-                        "--display-name", name,
-                        "--ssh-authorized-keys-file", keyfile.name,
-                        "--boot-volume-size-in-gbs", "50", timeout=95)
-        except OCIError as err:
-            print(f"[OCI] {err.code}: {err.message}")
-            if err.code in {"OutOfHostCapacity", "OutOfCapacity", "OutOfHostCapacityError"} or "out of host capacity" in err.message.lower():
-                print("[RETRY-LATER] No capacity. Next scheduled attempt in ~30 min. Nothing created.")
-                return 0
-            if err.code in {"TooManyRequests", "Throttling"} or err.status == 429:
-                print("[BACKOFF] OCI rate limit. No immediate retry; next schedule will try again.")
-                return 0
-            if err.code in {"LimitExceeded", "QuotaExceeded"}:
-                notify("Oracle A1 hunt stopped: account lacks free A1 quota. See Actions log / OCI Limits.")
-                disable_workflow()
-                return 2
+            result = client.get_resource_availability(
+                "compute", name, compartment, **kwargs,
+            ).data
+        except oci.exceptions.ServiceError as exc:
+            if exc.status in {404} or (exc.status == 400 and exc.code in {"InvalidParameter", "NotSupported"}):
+                info("WARN", f"{name}: usage API unavailable ({exc.code}), quota UNKNOWN")
+                continue
             raise
+        # Fractional availability is more accurate than rounded availability.
+        available = getattr(result, "fractional_available", None)
+        if available is None:
+            available = getattr(result, "available", None)
+        used = getattr(result, "fractional_used", None)
+        if used is None:
+            used = getattr(result, "used", None)
+        info("LIMIT", f"{name}: available={available if available is not None else 'UNKNOWN'}, used={used if used is not None else 'UNKNOWN'}")
+        need = ocpus if unit == "cpu" else memory
+        if available is not None and float(available) < need:
+            raise StopRun(f"LimitExceeded: {name} available={available} < requested={need:g}; do not retry without changing quota")
 
-    instance_id = inst.get("id")
-    if not instance_id:
-        raise OCIError("MissingInstanceId", "OCI response did not contain instance id; inspect OCI Console before retrying")
-    print("[OK] Oracle accepted launch request; checking VM lifecycle")
-    status = wait_running(instance_id)
-    if status == "RUNNING":
-        print("[SUCCESS] A1 VM is RUNNING; no more launch requests")
-        notify(f"Success! Oracle A1 {ocpus:g} OCPU/{memory:g} GB is RUNNING in {region}. Open OCI Console to find its IP. SSH key remains with you; nothing private was sent to Telegram.")
+
+def get_existing(compute: Any, compartment: str, name: str):
+    info("PHASE", "Checking existing instances via OCI Python SDK")
+    response = oci.pagination.list_call_get_all_results(
+        compute.list_instances, compartment, display_name=name,
+    )
+    for item in response.data:
+        if item.display_name == name and item.lifecycle_state not in {"TERMINATED", "TERMINATING"}:
+            return item
+    return None
+
+
+def wait_running(compute: Any, instance_id: str) -> str:
+    for index in range(15):
+        state = compute.get_instance(instance_id).data.lifecycle_state
+        info("VM", f"Current state: {state}")
+        if state in {"RUNNING", "TERMINATED", "TERMINATING"}:
+            return state
+        if index < 14:
+            time.sleep(15)
+    return "PROVISIONING"
+
+
+def handle_oci_error(exc: Exception, mode: str) -> int:
+    code, status, message = classify(exc)
+    info("OCI-ERROR", f"code={code}, http={status or 'unknown'}, message={message}")
+    if code in {"OutOfHostCapacity", "OutOfCapacity", "OutOfHostCapacityError"} or "out of host capacity" in message.lower():
+        info("RETRY-LATER", "Oracle lacks host capacity; next scheduled run can retry")
+        return 0
+    if status == 429 or code in {"TooManyRequests", "Throttling"}:
+        info("BACKOFF", "Oracle throttled the request; wait until next scheduled run")
+        return 0
+    if code in {"LimitExceeded", "QuotaExceeded"}:
+        info("HALT", "Oracle service limit exceeded; scheduling stopped to avoid futile retries")
+        notify("Oracle A1 hunt: quota LimitExceeded; check Limits in Oracle Console")
+        if mode == "launch":
+            disable_workflow()
+        return 2
+    return 1
+
+
+def main() -> int:
+    tenancy = env("OCI_TENANCY_OCID", required=True)
+    region = env("OCI_REGION", required=True)
+    subnet_id = env("OCI_SUBNET_ID", required=True)
+    compartment = env("OCI_COMPARTMENT_OCID", tenancy)
+    mode = env("HUNT_MODE", "check").lower()
+    if mode not in {"check", "launch"}:
+        raise StopRun("HUNT_MODE must be 'check' or 'launch'")
+    cpu = float(env("A1_OCPUS", "2"))
+    memory = float(env("A1_MEMORY_GB", "12"))
+    if cpu <= 0 or memory <= 0 or cpu > 2 or memory > 12:
+        raise StopRun("Safety limit: Always Free A1 maximum 2 OCPU / 12 GB, shared across all A1 instances")
+    name = env("A1_DISPLAY_NAME", "Oracle-ARM-Always-Free")
+    ssh_key = validate_pubkey() if mode == "launch" else ""
+    info("INFO", f"Mode={mode}; region={region}; A1={cpu:g} OCPU/{memory:g}GB")
+
+    config_file = env("OCI_CONFIG_FILE", required=True)
+    if not os.path.isfile(config_file):
+        raise StopRun("OCI_CONFIG_FILE does not exist")
+    info("PHASE", "Loading OCI config and creating SDK clients")
+    config = oci.config.from_file(config_file)
+    oci.config.validate_config(config)
+    network, compute, identity, limits = get_clients(config)
+
+    info("PHASE", "Validating subnet, AD and image")
+    subnet = network.get_subnet(subnet_id).data
+    if subnet.lifecycle_state != "AVAILABLE":
+        raise StopRun(f"Subnet lifecycle_state={subnet.lifecycle_state}; expected AVAILABLE")
+    if subnet.prohibit_public_ip_on_vnic:
+        raise StopRun("Selected subnet does not allow a public IP")
+    ad = choose_ad(identity, tenancy, subnet)
+    image_id = choose_image(compute, compartment)
+    image = compute.get_image(image_id).data
+    if image.lifecycle_state in {"DISABLED", "DELETED"}:
+        raise StopRun("Selected OS image has been disabled/deleted")
+    info("OK", f"Subnet and image validated; AD={ad}")
+
+    existing = get_existing(compute, compartment, name)
+    if existing:
+        info("SAFE", f"Existing instance with target name found, state={existing.lifecycle_state}; no new VM will be created")
+        if existing.lifecycle_state == "RUNNING" and mode == "launch":
+            notify("Oracle A1 already RUNNING; workflow disabled to prevent duplicate launch")
+            disable_workflow()
+        return 0
+
+    info("PHASE", "Checking limits (unknown is NOT the same as enough quota)")
+    try:
+        check_limits(limits, compartment, ad, cpu, memory)
+    except StopRun as stop:
+        info("HALT", str(stop))
+        if mode == "launch":
+            notify("Oracle A1 hunt stopped: insufficient service quota")
+            disable_workflow()
+        return 2
+    info("OK", "Preflight finished; the limits API may still have UNKNOWN values")
+    if mode == "check":
+        info("SAFE", "CHECK PASS: no instance created; run workflow with launch to attempt one")
+        return 0
+
+    details = oci.core.models.LaunchInstanceDetails(
+        availability_domain=ad,
+        compartment_id=compartment,
+        display_name=name,
+        shape="VM.Standard.A1.Flex",
+        shape_config=oci.core.models.LaunchInstanceShapeConfigDetails(
+            ocpus=cpu, memory_in_gbs=memory,
+        ),
+        source_details=oci.core.models.InstanceSourceViaImageDetails(
+            image_id=image_id, boot_volume_size_in_gbs=50,
+        ),
+        create_vnic_details=oci.core.models.CreateVnicDetails(
+            subnet_id=subnet_id, assign_public_ip=True,
+        ),
+        metadata={"ssh_authorized_keys": ssh_key},
+    )
+    info("TRY", "Sending exactly one launch request")
+    try:
+        instance = compute.launch_instance(
+            details, retry_strategy=oci.retry.NoneRetryStrategy()
+        ).data
+    except oci.exceptions.ServiceError as exc:
+        return handle_oci_error(exc, mode)
+    if not instance.id:
+        raise StopRun("Oracle accepted launch but did not provide instance ID; check Console before retrying")
+    info("OK", "Launch accepted; tracking lifecycle state")
+    state = wait_running(compute, instance.id)
+    if state == "RUNNING":
+        info("SUCCESS", "Oracle A1 VM is RUNNING")
+        notify(f"Oracle A1 is RUNNING ({region}, {cpu:g} OCPU/{memory:g} GB). Find its IP in Oracle Console. Private SSH key stays in Cloud Shell.")
         disable_workflow()
         return 0
-    if status in {"TERMINATED", "TERMINATING"}:
-        print("[FAIL] Instance was terminated during provisioning; inspect OCI Console")
+    if state in {"TERMINATED", "TERMINATING"}:
+        info("FAIL", "Instance terminated during creation; inspect Oracle Console")
         return 3
-    print("[PENDING] Launch accepted; VM not confirmed RUNNING yet. No new launch until next scheduled check")
+    info("PENDING", "Launch accepted but not RUNNING yet. The next run will detect the existing VM and NOT create another")
     return 0
 
 
 if __name__ == "__main__":
     try:
         sys.exit(main())
-    except (ValueError, OCIError) as exc:
-        print(f"[STOP] {exc}", file=sys.stderr)
+    except StopRun as exc:
+        info("STOP", str(exc))
+        sys.exit(1)
+    except oci.exceptions.ServiceError as exc:
+        sys.exit(handle_oci_error(exc, env("HUNT_MODE", "check")))
+    except (ValueError, OSError) as exc:
+        info("STOP", f"{type(exc).__name__}: {str(exc)[:300]}")
         sys.exit(1)
